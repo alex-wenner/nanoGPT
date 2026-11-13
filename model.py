@@ -91,6 +91,53 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class MoE(nn.Module):
+    """Sparse Mixture-of-Experts FFN (Switch Transformer / DeepSeek-style).
+    Replaces the dense MLP: a tiny router scores all experts per token, picks the
+    top_k best, and mixes only their outputs. Total parameters grow with n_expert,
+    but per-token FLOPs stay close to a top_k-wide dense model."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_expert = config.n_expert
+        self.top_k = config.top_k
+        # the router: one linear layer producing an affinity score per expert
+        self.gate = nn.Linear(config.n_embd, config.n_expert, bias=False)
+        # the experts themselves: identical structure to the dense MLP we replaced
+        self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_expert)])
+        self.aux_loss = None
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x_flat = x.view(-1, C)                                    # (B*T, C): routing is per-token
+        probs = F.softmax(self.gate(x_flat), dim=-1)              # (B*T, n_expert) affinities
+        weights, indices = torch.topk(probs, self.top_k, dim=-1)  # choose top_k experts per token
+        weights = weights / weights.sum(dim=-1, keepdim=True)     # renormalize chosen weights to sum to 1
+
+        flat_indices = indices.reshape(-1)
+        flat_weights = weights.reshape(-1)
+        flat_tokens = torch.arange(x_flat.size(0), device=x.device).repeat_interleave(self.top_k)
+
+        # dispatch: each expert runs only on the tokens that chose it
+        out = torch.zeros_like(x_flat)
+        for e, expert in enumerate(self.experts):
+            mask = flat_indices == e
+            if mask.any():
+                rows = flat_tokens[mask]
+                w = flat_weights[mask].unsqueeze(-1)
+                out.index_add_(0, rows, w * expert(x_flat[rows]))
+
+        # load-balancing loss (Switch Transformer): without it the router collapses
+        # onto one favorite expert and the MoE silently degenerates to dense
+        with torch.no_grad():
+            f = torch.zeros(self.n_expert, device=x.device)
+            f.scatter_add_(0, flat_indices, torch.ones_like(flat_weights))
+            f = f / flat_indices.numel()                          # fraction of tokens per expert
+        P = probs.mean(dim=0)                                     # mean router prob per expert
+        self.aux_loss = self.n_expert * (f * P).sum()
+
+        return out.view(B, T, C)
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -98,7 +145,7 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = MoE(config) if getattr(config, 'use_moe', False) else MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
